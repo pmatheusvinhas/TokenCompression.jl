@@ -1,7 +1,7 @@
 """
     TokenCompression
 
-A Julia package for efficient compression of token sequences using Byte Pair Encoding (BPE).
+A Julia package for efficient compression of token sequences using Byte Pair Encoding (BPE) with optional GPU acceleration.
 
 # Features
 - Byte Pair Encoding (BPE) implementation
@@ -10,6 +10,7 @@ A Julia package for efficient compression of token sequences using Byte Pair Enc
 - Support for UInt32 token sequences
 - High-performance model serialization
 - Thread-safe operations
+- GPU acceleration when available
 
 # Example
 ```julia
@@ -36,9 +37,12 @@ module TokenCompression
 
 using Statistics
 using ThreadsX
+using CUDA
+using LinearAlgebra
 
 export optimize_tokens, TokenPattern, train_bpe, TokenPair
 export save_model, load_model, decompress_tokens
+export compress_batch, has_gpu
 
 include("types.jl")
 include("bpe.jl")
@@ -49,9 +53,19 @@ include("serialization.jl")
 using .BPE: count_pairs, find_best_pair, merge_pair!
 
 """
+    has_gpu()
+
+Check if a CUDA-capable GPU is available and functional.
+"""
+function has_gpu()
+    return CUDA.functional()
+end
+
+"""
     parallel_countmap(tokens::Vector{UInt32})
 
 Count frequencies of tokens in parallel for large sequences.
+Uses GPU if available, otherwise uses CPU threads.
 """
 function parallel_countmap(tokens::Vector{UInt32})
     if length(tokens) < BPE.MIN_PARALLEL_SIZE
@@ -63,6 +77,41 @@ function parallel_countmap(tokens::Vector{UInt32})
         return counts
     end
     
+    if has_gpu()
+        try
+            # Move to GPU and count frequencies
+            d_tokens = CuArray(tokens)
+            d_counts = CUDA.zeros(Int, maximum(tokens))
+            
+            # Use atomic operations for counting
+            CUDA.@sync for token in d_tokens
+                CUDA.@atomic d_counts[token] += 1
+            end
+            
+            # Convert back to dictionary
+            counts = Dict{UInt32, Int}()
+            h_counts = Array(d_counts)
+            for i in 1:length(h_counts)
+                if h_counts[i] > 0
+                    counts[UInt32(i)] = h_counts[i]
+                end
+            end
+            return counts
+        catch e
+            @warn "GPU counting failed, falling back to CPU" exception=e
+            return parallel_countmap_cpu(tokens)
+        end
+    else
+        return parallel_countmap_cpu(tokens)
+    end
+end
+
+"""
+    parallel_countmap_cpu(tokens::Vector{UInt32})
+
+CPU fallback for parallel token counting.
+"""
+function parallel_countmap_cpu(tokens::Vector{UInt32})
     # Split into batches for parallel processing
     n_batches = max(1, div(length(tokens), BPE.BATCH_SIZE))
     batch_size = div(length(tokens), n_batches)
@@ -87,6 +136,94 @@ function parallel_countmap(tokens::Vector{UInt32})
     end
     
     return merged
+end
+
+"""
+    compress_batch(tokens::Matrix{UInt32})
+
+Compress a batch of token sequences in parallel.
+Uses GPU acceleration if available.
+
+# Arguments
+- `tokens::Matrix{UInt32}`: Input token sequences, where each row is a sequence
+
+# Returns
+- `Matrix{UInt32}`: Compressed token sequences, where each row may have a different length
+"""
+function compress_batch(tokens::Matrix{UInt32})
+    if has_gpu()
+        try
+            # Process in smaller batches to avoid memory issues
+            batch_size = 1000
+            num_batches = ceil(Int, size(tokens, 1) / batch_size)
+            compressed_sequences = Vector{Vector{UInt32}}()
+            
+            for i in 1:num_batches
+                start_idx = (i-1) * batch_size + 1
+                end_idx = min(i * batch_size, size(tokens, 1))
+                batch = tokens[start_idx:end_idx, :]
+                
+                # Move batch to GPU
+                d_batch = CuArray(batch)
+                
+                # Process each row
+                batch_compressed = mapslices(row -> 
+                    Array(optimize_tokens(Array(row))), 
+                    d_batch, dims=2)
+                
+                # Store compressed sequences
+                for row in eachrow(batch_compressed)
+                    push!(compressed_sequences, collect(row))
+                end
+            end
+            
+            # Find maximum length for padding
+            max_length = maximum(length.(compressed_sequences))
+            
+            # Create result matrix with padding
+            result = Matrix{UInt32}(undef, length(compressed_sequences), max_length)
+            fill!(result, UInt32(0))  # Fill with zeros for padding
+            
+            # Copy compressed sequences with padding
+            for (i, seq) in enumerate(compressed_sequences)
+                result[i, 1:length(seq)] = seq
+            end
+            
+            return result
+        catch e
+            @warn "GPU batch compression failed, falling back to CPU" exception=e
+            return compress_batch_cpu(tokens)
+        end
+    else
+        return compress_batch_cpu(tokens)
+    end
+end
+
+"""
+    compress_batch_cpu(tokens::Matrix{UInt32})
+
+CPU fallback for batch compression.
+"""
+function compress_batch_cpu(tokens::Matrix{UInt32})
+    # Compress each sequence
+    compressed_sequences = Vector{Vector{UInt32}}()
+    for row in eachrow(tokens)
+        push!(compressed_sequences, optimize_tokens(collect(row)))
+    end
+    
+    # Find maximum length for padding
+    max_length = maximum(length.(compressed_sequences))
+    
+    # Create result matrix with padding
+    result = Matrix{UInt32}(undef, length(compressed_sequences), max_length)
+    fill!(result, UInt32(0))  # Fill with zeros for padding
+    
+    # Copy compressed sequences with padding
+    for (i, seq) in enumerate(compressed_sequences)
+        result[i, 1:length(seq)] = seq
+    end
+    
+    return result
 end
 
 """
